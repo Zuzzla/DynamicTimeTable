@@ -1,0 +1,34 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.10.0-beta.2",
+    "FriendlyName": "DynamicTimeTable",
+    "Description": "Dual singleplayer and multiplayer dynamic train timetable routing.",
+    "Category": "Modding",
+    "CreatedBy": "Zuzzla",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "BuiltInInitialFeatureState": "Active",
+    "Plugins": [
+        {
+            "Name": "SML",
+            "Enabled": true,
+            "SemVersion": "^3.12.0"
+        }
+    ],
+    "Modules": [
+        {
+            "Name": "DynamicTimeTable",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "SemVersion": "1.3.0",
+    "GameVersion": ">=491125"
+}
