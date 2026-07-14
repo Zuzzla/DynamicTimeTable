@@ -25,6 +25,9 @@ public:
     virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 
     void HandleTrainDocked(AFGTrain* Train, AFGBuildableRailroadStation* DockedStation);
+    void HandleTimeTableChanged(AFGRailroadTimeTable* TimeTable);
+    void HandleSelfDrivingChanged(AFGTrain* Train, bool bEnabled);
+    void HandleStationNameChanged(AFGTrainStationIdentifier* Identifier);
 
     UFUNCTION(BlueprintCallable, Category = "Dynamic Time Table|Groups") FGuid CreateGroup(const FString& GroupName);
     UFUNCTION(BlueprintCallable, Category = "Dynamic Time Table|Groups") bool RemoveGroup(FGuid GroupId);
@@ -49,6 +52,9 @@ private:
     TWeakObjectPtr<ADTTSaveDataActor> SaveDataActor;
     bool bPersistenceReady = false;
     int32 ConfigurationRevision = 0;
+    TSet<AFGRailroadTimeTable*> InternalTimeTableChanges;
+    TSet<TWeakObjectPtr<AFGRailroadTimeTable>> PendingTimeTableReevaluations;
+    bool bTimeTableReevaluationScheduled = false;
 
     void InitializePersistence();
     void RegisterDTTChatCommand();
@@ -62,12 +68,19 @@ private:
     FDTTStationEntry* FindStationEntry(FDTTStationGroup& Group, const FString& StationName);
     const FDTTStationEntry* FindStationEntry(const FDTTStationGroup& Group, const FString& StationName) const;
     AFGTrainStationIdentifier* FindVanillaStationByName(const FString& StationName) const;
-    void ResolveStationReferences();
+    bool ResolveStationReferences();
+    bool RefreshStationDisplayName(AFGTrainStationIdentifier* Identifier);
     void RemoveInvalidBookings();
     void ReleaseBookingIfReached(AFGTrain* Train, AFGTrainStationIdentifier* DockedIdentifier);
+    void ReleaseBooking(AFGTrain* Train, const TCHAR* Reason);
+    AFGTrain* FindTrainByTimeTable(AFGRailroadTimeTable* TimeTable) const;
+    void SchedulePendingTimeTableReevaluation();
+    void ProcessPendingTimeTableReevaluations();
+    void ProcessCurrentTarget(AFGTrain* Train, const TCHAR* Trigger);
     void RefreshPriorityIndices(FDTTStationGroup& Group);
     void ConfigurationChanged(bool bRecalculateBookings = true);
     FDTTStationEntry* SelectBestStation(FDTTStationGroup& Group);
     int32 GetAssignedCount(AFGTrainStationIdentifier* Identifier) const;
-    bool ReplaceCurrentStop(AFGRailroadTimeTable* TimeTable, int32 CurrentStop, AFGTrainStationIdentifier* NewIdentifier) const;
+    int32 CountStopsInGroup(AFGRailroadTimeTable* TimeTable, const FDTTStationGroup& Group) const;
+    bool ReplaceCurrentStop(AFGRailroadTimeTable* TimeTable, int32 CurrentStop, AFGTrainStationIdentifier* NewIdentifier);
 };

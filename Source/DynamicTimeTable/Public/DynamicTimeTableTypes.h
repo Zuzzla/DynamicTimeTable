@@ -19,8 +19,9 @@ struct FDTTStationEntry
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, SaveGame, Category = "Dynamic Time Table")
     int32 PriorityIndex = 0;
 
-    // Runtime-only. Re-resolved from DisplayName after loading.
-    TWeakObjectPtr<AFGTrainStationIdentifier> StationIdentifier;
+    // Persistent identity; DisplayName is only a live display cache.
+    UPROPERTY(SaveGame)
+    TObjectPtr<AFGTrainStationIdentifier> StationIdentifier = nullptr;
 };
 
 USTRUCT(BlueprintType)

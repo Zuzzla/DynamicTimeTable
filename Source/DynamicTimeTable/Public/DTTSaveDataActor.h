@@ -26,10 +26,12 @@ public:
 
     void SetGroups(const TArray<FDTTStationGroup>& InGroups);
     const TArray<FDTTStationGroup>& GetGroups() const { return SavedGroups; }
+    int32 GetDataVersion() const { return DataVersion; }
+    void SetDataVersion(int32 InVersion) { DataVersion = InVersion; }
 
 private:
     UPROPERTY(SaveGame)
-    int32 DataVersion = 1;
+    int32 DataVersion = 2;
 
     UPROPERTY(SaveGame)
     TArray<FDTTStationGroup> SavedGroups;
