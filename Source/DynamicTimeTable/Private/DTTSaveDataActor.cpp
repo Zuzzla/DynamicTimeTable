@@ -1,4 +1,5 @@
 #include "DTTSaveDataActor.h"
+#include "FGTrainStationIdentifier.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogDynamicTimeTableSaveData, Log, All);
 
@@ -48,6 +49,15 @@ void ADTTSaveDataActor::PostLoadGame_Implementation(int32 saveVersion, int32 gam
 
 void ADTTSaveDataActor::GatherDependencies_Implementation(TArray<UObject*>& out_dependentObjects)
 {
-    // Configuration contains only value types and station names.
+    for (const FDTTStationGroup& Group : SavedGroups)
+    {
+        for (const FDTTStationEntry& Entry : Group.Stations)
+        {
+            if (IsValid(Entry.StationIdentifier.Get()))
+            {
+                out_dependentObjects.AddUnique(Entry.StationIdentifier.Get());
+            }
+        }
+    }
 }
 

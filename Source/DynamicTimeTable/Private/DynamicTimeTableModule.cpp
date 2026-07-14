@@ -5,6 +5,8 @@
 #include "FGTrain.h"
 #include "FGPlayerController.h"
 #include "FGRemoteCallObject.h"
+#include "FGRailroadTimeTable.h"
+#include "FGTrainStationIdentifier.h"
 #include "Buildables/FGBuildableRailroadStation.h"
 #include "DynamicTimeTableSubsystem.h"
 #include "DynamicTimeTableRemoteCallObject.h"
@@ -16,7 +18,10 @@ void FDynamicTimeTableModule::StartupModule(){UE_LOG(LogDynamicTimeTableModule,L
 UE_LOG(LogDynamicTimeTableModule,Log,TEXT("Editor build: runtime registration disabled."));
 #else
 PlayerControllerBegunPlayHandle=AFGPlayerController::PlayerControllerBegunPlay.AddLambda([](AFGPlayerController* PC){if(!IsValid(PC))return;UFGRemoteCallObject* R=PC->RegisterRemoteCallObjectClass(UDynamicTimeTableRemoteCallObject::StaticClass());UE_LOG(LogDynamicTimeTableModule,Log,TEXT("dTT RCO registration. Success=%s"),IsValid(R)?TEXT("true"):TEXT("false"));});
-SUBSCRIBE_METHOD_AFTER(AFGTrain::OnDocked,[](AFGTrain* Train,AFGBuildableRailroadStation* Station){if(!IsValid(Train)||!IsValid(Train->GetWorld()))return;if(UDynamicTimeTableSubsystem* S=Train->GetWorld()->GetSubsystem<UDynamicTimeTableSubsystem>())S->HandleTrainDocked(Train,Station);});
+SUBSCRIBE_METHOD_AFTER(AFGTrain::OnDocked,[](AFGTrain* Train,AFGBuildableRailroadStation* Station){if(IsValid(Train)&&IsValid(Train->GetWorld()))if(auto* S=Train->GetWorld()->GetSubsystem<UDynamicTimeTableSubsystem>())S->HandleTrainDocked(Train,Station);});
+SUBSCRIBE_METHOD_AFTER(AFGRailroadTimeTable::SetStops,[](const bool& Ok,AFGRailroadTimeTable* T,const TArray<FTimeTableStop>& Stops){(void)Stops;if(Ok&&IsValid(T)&&IsValid(T->GetWorld()))if(auto* S=T->GetWorld()->GetSubsystem<UDynamicTimeTableSubsystem>())S->HandleTimeTableChanged(T);});
+SUBSCRIBE_METHOD_AFTER(AFGTrainStationIdentifier::SetStationName,[](AFGTrainStationIdentifier* Id,const FText& Name){(void)Name;if(IsValid(Id)&&IsValid(Id->GetWorld()))if(auto* S=Id->GetWorld()->GetSubsystem<UDynamicTimeTableSubsystem>())S->HandleStationNameChanged(Id);});
+SUBSCRIBE_METHOD_AFTER(AFGTrain::SetSelfDrivingEnabled,[](AFGTrain* Train,bool Enabled){if(IsValid(Train)&&IsValid(Train->GetWorld()))if(auto* S=Train->GetWorld()->GetSubsystem<UDynamicTimeTableSubsystem>())S->HandleSelfDrivingChanged(Train,Enabled);});
 #endif
 }
 void FDynamicTimeTableModule::ShutdownModule(){

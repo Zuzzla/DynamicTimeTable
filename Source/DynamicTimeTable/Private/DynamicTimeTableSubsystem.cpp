@@ -10,6 +10,7 @@
 #include "Buildables/FGBuildableRailroadStation.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "TimerManager.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogDynamicTimeTableSubsystem, Log, All);
 
@@ -30,6 +31,9 @@ void UDynamicTimeTableSubsystem::Initialize(FSubsystemCollectionBase& Collection
 void UDynamicTimeTableSubsystem::Deinitialize()
 {
     ActiveBookings.Reset();
+    InternalTimeTableChanges.Reset();
+    PendingTimeTableReevaluations.Reset();
+    bTimeTableReevaluationScheduled = false;
     StationGroups.Reset();
     SaveDataActor.Reset();
     bPersistenceReady = false;
@@ -85,7 +89,7 @@ void UDynamicTimeTableSubsystem::InitializePersistence()
         SaveDataActor = Found;
         StationGroups = Found->GetGroups();
         UE_LOG(LogDynamicTimeTableSubsystem, Display,
-            TEXT("Imported persistent dTT configuration. Groups=%d"), StationGroups.Num());
+            TEXT("Imported persistent dTT configuration. Groups=%d DataVersion=%d"), StationGroups.Num(), Found->GetDataVersion());
     }
     else if (GetWorld()->GetNetMode() != NM_Client)
     {
@@ -102,7 +106,12 @@ void UDynamicTimeTableSubsystem::InitializePersistence()
     }
 
     bPersistenceReady = true;
-    ResolveStationReferences();
+    const bool bStationDataChanged = ResolveStationReferences();
+    if (SaveDataActor.IsValid() && SaveDataActor->GetDataVersion() < 2)
+    {
+        SaveDataActor->SetDataVersion(2);
+        UE_LOG(LogDynamicTimeTableSubsystem, Display, TEXT("Migrated dTT station identity to DataVersion=2. Changed=%s"), bStationDataChanged ? TEXT("true") : TEXT("false"));
+    }
     RecalculateBookingsFromVanilla();
     SyncConfigurationToSaveActor();
     OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();
@@ -226,7 +235,29 @@ AFGTrainStationIdentifier* UDynamicTimeTableSubsystem::FindVanillaStationByName(
     return nullptr;
 }
 
-void UDynamicTimeTableSubsystem::ResolveStationReferences(){for(auto&G:StationGroups)for(auto&E:G.Stations)if(!E.StationIdentifier.IsValid())E.StationIdentifier=FindVanillaStationByName(E.DisplayName);}
+bool UDynamicTimeTableSubsystem::ResolveStationReferences()
+{
+    bool bChanged=false;
+    for(auto& G:StationGroups) for(auto& E:G.Stations)
+    {
+        AFGTrainStationIdentifier* Id=E.StationIdentifier.Get();
+        if(!IsValid(Id)){Id=FindVanillaStationByName(E.DisplayName);if(IsValid(Id)){E.StationIdentifier=Id;bChanged=true;}}
+        if(IsValid(Id)){const FString N=Id->GetStationName().ToString();if(E.DisplayName!=N){E.DisplayName=N;bChanged=true;}}
+    }
+    return bChanged;
+}
+bool UDynamicTimeTableSubsystem::RefreshStationDisplayName(AFGTrainStationIdentifier* Id)
+{
+    if(!IsValid(Id))return false;bool bChanged=false;const FString N=Id->GetStationName().ToString();
+    for(auto& G:StationGroups)for(auto& E:G.Stations)if(E.StationIdentifier.Get()==Id&&E.DisplayName!=N){E.DisplayName=N;bChanged=true;}
+    return bChanged;
+}
+void UDynamicTimeTableSubsystem::HandleStationNameChanged(AFGTrainStationIdentifier* Id)
+{
+    UWorld* W=GetWorld();if(!IsValid(W)||W->GetNetMode()==NM_Client||!RefreshStationDisplayName(Id))return;
+    ++ConfigurationRevision;SyncConfigurationToSaveActor();OnGroupsChanged.Broadcast();OnGroupsChangedNative.Broadcast();
+    UE_LOG(LogDynamicTimeTableSubsystem,Display,TEXT("STATION_RENAMED Station='%s' ConfigurationRevision=%d"),*Id->GetStationName().ToString(),ConfigurationRevision);
+}
 void UDynamicTimeTableSubsystem::RefreshPriorityIndices(FDTTStationGroup& G){for(int32 i=0;i<G.Stations.Num();++i)G.Stations[i].PriorityIndex=i;}
 void UDynamicTimeTableSubsystem::ConfigurationChanged(bool Recalc){++ConfigurationRevision;ResolveStationReferences();SyncConfigurationToSaveActor();if(Recalc)RecalculateBookingsFromVanilla();else OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();}
 void UDynamicTimeTableSubsystem::RemoveInvalidBookings(){for(auto It=ActiveBookings.CreateIterator();It;++It)if(!IsValid(It.Key())||!IsValid(It.Value()))It.RemoveCurrent();}
@@ -247,14 +278,59 @@ FDTTStationEntry* UDynamicTimeTableSubsystem::SelectBestStation(FDTTStationGroup
     return Best;
 }
 
-bool UDynamicTimeTableSubsystem::ReplaceCurrentStop(AFGRailroadTimeTable*T,int32 I,AFGTrainStationIdentifier*Id)const{if(!IsValid(T)||!IsValid(Id)||!T->IsValidStop(I))return false;TArray<FTimeTableStop>S;T->GetStops(S);if(!S.IsValidIndex(I))return false;S[I].Station=Id;return T->SetStops(S);}
-void UDynamicTimeTableSubsystem::HandleTrainDocked(AFGTrain*Train,AFGBuildableRailroadStation*DockedStation)
+int32 UDynamicTimeTableSubsystem::CountStopsInGroup(AFGRailroadTimeTable* TimeTable, const FDTTStationGroup& Group) const
 {
-    if(!IsValid(Train)||!IsValid(DockedStation))return;if(!bPersistenceReady)InitializePersistence();RemoveInvalidBookings();ResolveStationReferences();auto*Docked=DockedStation->GetStationIdentifier();ReleaseBookingIfReached(Train,Docked);auto*T=Train->GetTimeTable();const int32 I=IsValid(T)?T->GetCurrentStop():INDEX_NONE;if(!IsValid(T)||!T->IsValidStop(I))return;auto*Ref=T->GetStop(I).Station.Get();auto*G=FindGroupByStation(Ref);UE_LOG(LogDynamicTimeTableSubsystem,VeryVerbose,TEXT("dTT Docked: Train='%s' Station='%s' CurrentStop=%d Target='%s' Group=%s"),*Train->GetTrainName().ToString(),*DTSStationName(Docked),I,*DTSStationName(Ref),G?*G->GroupName:TEXT("<none>"));if(!G||ActiveBookings.Contains(Train))return;auto*Sel=SelectBestStation(*G);if(!Sel||!Sel->StationIdentifier.IsValid())return;auto*Id=Sel->StationIdentifier.Get();const bool Ok=ReplaceCurrentStop(T,I,Id);const FString Verified=T->IsValidStop(I)?DTSStationName(T->GetStop(I).Station.Get()):TEXT("<invalid>");if(Ok&&Verified==Sel->DisplayName){ActiveBookings.Add(Train,Id);const int32 C=GetAssignedCount(Id);UE_LOG(LogDynamicTimeTableSubsystem,Verbose,TEXT("ASSIGNED Train='%s' Selected='%s' Verified='%s' Load=%d/%d%s"),*Train->GetTrainName().ToString(),*Sel->DisplayName,*Verified,C,Sel->TargetSlots,C>Sel->TargetSlots?TEXT(" OVERLOAD"):TEXT(""));}OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();
+    if (!IsValid(TimeTable)) return 0;
+
+    TArray<FTimeTableStop> Stops;
+    TimeTable->GetStops(Stops);
+
+    int32 Count = 0;
+    for (const FTimeTableStop& Stop : Stops)
+    {
+        AFGTrainStationIdentifier* StopIdentifier = Stop.Station.Get();
+        if (!IsValid(StopIdentifier)) continue;
+
+        if (Group.Stations.ContainsByPredicate([StopIdentifier](const FDTTStationEntry& Entry)
+        {
+            return Entry.StationIdentifier.Get() == StopIdentifier;
+        }))
+        {
+            ++Count;
+        }
+    }
+
+    return Count;
 }
 
+bool UDynamicTimeTableSubsystem::ReplaceCurrentStop(AFGRailroadTimeTable* T,int32 I,AFGTrainStationIdentifier* Id){if(!IsValid(T)||!IsValid(Id)||!T->IsValidStop(I))return false;TArray<FTimeTableStop>S;T->GetStops(S);if(!S.IsValidIndex(I))return false;S[I].Station=Id;InternalTimeTableChanges.Add(T);const bool Ok=T->SetStops(S);InternalTimeTableChanges.Remove(T);return Ok;}
+void UDynamicTimeTableSubsystem::ReleaseBooking(AFGTrain* Train,const TCHAR* Reason){if(!IsValid(Train))return;if(AFGTrainStationIdentifier** Existing=ActiveBookings.Find(Train)){UE_LOG(LogDynamicTimeTableSubsystem,Verbose,TEXT("RELEASED Train='%s' Target='%s' Reason=%s"),*Train->GetTrainName().ToString(),*DTSStationName(*Existing),Reason);ActiveBookings.Remove(Train);OnGroupsChanged.Broadcast();OnGroupsChangedNative.Broadcast();}}
+AFGTrain* UDynamicTimeTableSubsystem::FindTrainByTimeTable(AFGRailroadTimeTable* T)const{if(!IsValid(T))return nullptr;AFGRailroadSubsystem*R=AFGRailroadSubsystem::Get(GetWorld());if(!IsValid(R))return nullptr;TArray<AFGTrain*>Trains;R->GetAllTrains(Trains);for(AFGTrain*Train:Trains)if(IsValid(Train)&&Train->GetTimeTable()==T)return Train;return nullptr;}
+void UDynamicTimeTableSubsystem::HandleTimeTableChanged(AFGRailroadTimeTable* T)
+{
+    UWorld* W=GetWorld();if(!IsValid(W)||W->GetNetMode()==NM_Client||!IsValid(T)||InternalTimeTableChanges.Contains(T))return;
+    AFGTrain* Train=FindTrainByTimeTable(T);if(!IsValid(Train))return;ReleaseBooking(Train,TEXT("timetable saved"));PendingTimeTableReevaluations.Add(T);SchedulePendingTimeTableReevaluation();
+    UE_LOG(LogDynamicTimeTableSubsystem,Display,TEXT("TIMETABLE_CHANGED Train='%s' Stops=%d AutoPilot=%s BookingCleared=true Reevaluation=next-tick"),*Train->GetTrainName().ToString(),T->GetNumStops(),Train->IsSelfDrivingEnabled()?TEXT("true"):TEXT("false"));
+}
+void UDynamicTimeTableSubsystem::SchedulePendingTimeTableReevaluation()
+{
+    if(bTimeTableReevaluationScheduled)return;UWorld* W=GetWorld();if(!IsValid(W)||W->GetNetMode()==NM_Client)return;bTimeTableReevaluationScheduled=true;TWeakObjectPtr<UDynamicTimeTableSubsystem> WeakThis(this);
+    W->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateLambda([WeakThis](){if(WeakThis.IsValid())WeakThis->ProcessPendingTimeTableReevaluations();}));
+}
+void UDynamicTimeTableSubsystem::ProcessPendingTimeTableReevaluations()
+{
+    bTimeTableReevaluationScheduled=false;auto Pending=MoveTemp(PendingTimeTableReevaluations);PendingTimeTableReevaluations.Reset();
+    for(const auto& WeakT:Pending){auto* T=WeakT.Get();if(!IsValid(T))continue;auto* Train=FindTrainByTimeTable(T);if(!IsValid(Train)||!Train->IsSelfDrivingEnabled())continue;ProcessCurrentTarget(Train,TEXT("timetable saved"));}
+    if(PendingTimeTableReevaluations.Num()>0)SchedulePendingTimeTableReevaluation();
+}
+void UDynamicTimeTableSubsystem::HandleSelfDrivingChanged(AFGTrain* Train,bool bEnabled)
+{
+    UWorld* W=GetWorld();if(!IsValid(W)||W->GetNetMode()==NM_Client||!IsValid(Train))return;if(!bEnabled){ReleaseBooking(Train,TEXT("autopilot disabled"));return;}ReleaseBooking(Train,TEXT("autopilot enabled"));ProcessCurrentTarget(Train,TEXT("autopilot enabled"));
+}
+void UDynamicTimeTableSubsystem::ProcessCurrentTarget(AFGTrain*Train,const TCHAR*Trigger){if(!IsValid(Train)||!Train->IsSelfDrivingEnabled())return;if(!bPersistenceReady)InitializePersistence();RemoveInvalidBookings();ResolveStationReferences();AFGRailroadTimeTable*T=Train->GetTimeTable();const int32 I=IsValid(T)?T->GetCurrentStop():INDEX_NONE;if(!IsValid(T)||!T->IsValidStop(I))return;AFGTrainStationIdentifier*Ref=T->GetStop(I).Station.Get();FDTTStationGroup*G=FindGroupByStation(Ref);if(!G||ActiveBookings.Contains(Train))return;const int32 GroupStopCount=CountStopsInGroup(T,*G);if(GroupStopCount>1){ActiveBookings.Add(Train,Ref);const int32 C=GetAssignedCount(Ref);const FDTTStationEntry*E=G->Stations.FindByPredicate([Ref](const FDTTStationEntry&X){return X.StationIdentifier.Get()==Ref;});const int32 Slots=E?FMath::Max(1,E->TargetSlots):1;UE_LOG(LogDynamicTimeTableSubsystem,Verbose,TEXT("BOOKED_FIXED Train='%s' Target='%s' Group='%s' GroupStops=%d Load=%d/%d%s Trigger=%s"),*Train->GetTrainName().ToString(),*DTSStationName(Ref),*G->GroupName,GroupStopCount,C,Slots,C>Slots?TEXT(" OVERLOAD"):TEXT(""),Trigger);OnGroupsChanged.Broadcast();OnGroupsChangedNative.Broadcast();return;}FDTTStationEntry*Sel=SelectBestStation(*G);if(!Sel||!IsValid(Sel->StationIdentifier.Get()))return;AFGTrainStationIdentifier*Id=Sel->StationIdentifier.Get();const bool Ok=ReplaceCurrentStop(T,I,Id);const FString Verified=T->IsValidStop(I)?DTSStationName(T->GetStop(I).Station.Get()):TEXT("<invalid>");if(Ok&&Verified==Sel->DisplayName){ActiveBookings.Add(Train,Id);const int32 C=GetAssignedCount(Id);UE_LOG(LogDynamicTimeTableSubsystem,Verbose,TEXT("ASSIGNED Train='%s' Selected='%s' Load=%d/%d%s Trigger=%s"),*Train->GetTrainName().ToString(),*Sel->DisplayName,C,Sel->TargetSlots,C>Sel->TargetSlots?TEXT(" OVERLOAD"):TEXT(""),Trigger);}OnGroupsChanged.Broadcast();OnGroupsChangedNative.Broadcast();}
+void UDynamicTimeTableSubsystem::HandleTrainDocked(AFGTrain*Train,AFGBuildableRailroadStation*Station){if(!IsValid(Train)||!IsValid(Station))return;if(!bPersistenceReady)InitializePersistence();RemoveInvalidBookings();ResolveStationReferences();ReleaseBookingIfReached(Train,Station->GetStationIdentifier());ProcessCurrentTarget(Train,TEXT("train docked"));}
 void UDynamicTimeTableSubsystem::RecalculateBookingsFromVanilla()
 {
-    ActiveBookings.Reset();ResolveStationReferences();AFGRailroadSubsystem*R=AFGRailroadSubsystem::Get(GetWorld());if(!IsValid(R)){OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();return;}TArray<AFGTrain*>Trains;R->GetAllTrains(Trains);for(AFGTrain*Train:Trains){if(!IsValid(Train))continue;auto*T=Train->GetTimeTable();const int32 I=IsValid(T)?T->GetCurrentStop():INDEX_NONE;if(IsValid(T)&&T->IsValidStop(I)){auto*Target=T->GetStop(I).Station.Get();if(FindGroupByStation(Target))ActiveBookings.Add(Train,Target);}}UE_LOG(LogDynamicTimeTableSubsystem,Display,TEXT("Recalculated %d active booking(s) from Vanilla timetables."),ActiveBookings.Num());OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();
+    ActiveBookings.Reset();ResolveStationReferences();AFGRailroadSubsystem*R=AFGRailroadSubsystem::Get(GetWorld());if(!IsValid(R)){OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();return;}TArray<AFGTrain*>Trains;R->GetAllTrains(Trains);for(AFGTrain*Train:Trains){if(!IsValid(Train)||!Train->IsSelfDrivingEnabled())continue;auto*T=Train->GetTimeTable();const int32 I=IsValid(T)?T->GetCurrentStop():INDEX_NONE;if(IsValid(T)&&T->IsValidStop(I)){auto*Target=T->GetStop(I).Station.Get();if(FindGroupByStation(Target))ActiveBookings.Add(Train,Target);}}UE_LOG(LogDynamicTimeTableSubsystem,Display,TEXT("Recalculated %d active booking(s) from Vanilla timetables."),ActiveBookings.Num());OnGroupsChanged.Broadcast(); OnGroupsChangedNative.Broadcast();
 }
 
